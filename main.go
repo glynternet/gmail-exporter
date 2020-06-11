@@ -24,11 +24,15 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/gmail/v1"
+	"google.golang.org/api/googleapi"
 )
 
 // Retrieve a token, saves the token, then returns the generated client.
@@ -93,7 +97,7 @@ func main() {
 	}
 
 	// If modifying these scopes, delete your previously saved token.json.
-	config, err := google.ConfigFromJSON(b, gmail.GmailReadonlyScope)
+	config, err := google.ConfigFromJSON(b, gmail.GmailMetadataScope)
 	if err != nil {
 		log.Fatalf("Unable to parse client secret file to config: %v", err)
 	}
@@ -104,19 +108,145 @@ func main() {
 		log.Fatalf("Unable to retrieve Gmail client: %v", err)
 	}
 
-	user := "me"
-	r, err := srv.Users.Labels.List(user).Do()
+	e := exporter{
+		UsersLabelsService: srv.Users.Labels,
+		labelRefreshPeriod: time.Minute * 5,
+	}
+	go e.start()
+
+	prometheus.NewPedanticRegistry()
+
+	// Expose the registered metrics via HTTP.
+	registry := prometheus.NewRegistry()
+	if err = registry.Register(&e); err != nil {
+		panic(err)
+	}
+
+	http.Handle("/metrics", promhttp.HandlerFor(
+		registry,
+		promhttp.HandlerOpts{
+			// Opt into OpenMetrics to support exemplars.
+			EnableOpenMetrics: true,
+		},
+	))
+
+	addr := ":8765"
+	fmt.Println("listening at ", addr)
+	log.Fatal(http.ListenAndServe(addr, nil))
+}
+
+type exporter struct {
+	*gmail.UsersLabelsService
+	labelRefreshPeriod time.Duration
+	refreshingLabels
+}
+
+func (e exporter) Describe(_ chan<- *prometheus.Desc) {
+	// is this actually what I'm meant to do?
+	// no descriptions if the labels may change over time?
+	return
+}
+
+// TODO: instrument request time per label?
+
+func (e *exporter) Collect(metrics chan<- prometheus.Metric) {
+	const metricsPerLabel = 2
+	metricsCount := len(e.refreshingLabels) * metricsPerLabel
+	ms := make(chan prometheus.Metric, metricsCount)
+	for _, label := range e.refreshingLabels {
+		lData, err := e.Get(userID, label.id).Do()
+		if err != nil {
+			// how do I return an error so that it will be shown in prometheus here?
+			log.Println(fmt.Errorf("getting label data for label: %s: %v", label.id, err))
+			return
+		}
+		total, err := prometheus.NewConstMetric(
+			prometheus.NewDesc(
+				"gmail_messages_total",
+				"total messages for a gmail label",
+				nil,
+				label.promLabels()),
+			prometheus.GaugeValue,
+			float64(lData.MessagesTotal))
+		if err != nil {
+			panic(fmt.Errorf("generating gmail_messages_total total: %s: %v", label.id, err))
+		}
+		ms <- total
+		unread, err := prometheus.NewConstMetric(
+			prometheus.NewDesc(
+				"gmail_messages_unread_total",
+				"unread messages for a gmail label",
+				nil,
+				label.promLabels()),
+			prometheus.GaugeValue,
+			float64(lData.MessagesUnread))
+		if err != nil {
+			panic(fmt.Errorf("generating gmail_messages_unread total: %s: %v", label.id, err))
+		}
+		ms <- unread
+	}
+	for len(ms) > 0 {
+		metrics <- <-ms
+	}
+}
+
+func (e *exporter) start() {
+	if e.refreshingLabels == nil {
+		e.refreshingLabels = refreshingLabels{}
+	}
+
+	e.refreshLabels()
+	fmt.Println(e.refreshingLabels)
+	// TODO(gynternet): handle stopping ticker
+	t := time.NewTicker(e.labelRefreshPeriod)
+
+	for range t.C {
+		e.refreshLabels()
+		// log here
+		fmt.Println(e.refreshingLabels)
+	}
+}
+
+const userID = "me"
+
+func (e *exporter) refreshLabels() {
+	e.refresh(e.List(userID).Do)
+}
+
+type refreshingLabels []gmailLabel
+
+type gmailLabel struct {
+	name, id, ttype string
+}
+
+func (l gmailLabel) promLabels() prometheus.Labels {
+	return prometheus.Labels{
+		"label_name": l.name,
+		"label_id":   l.id,
+		"label_type": l.ttype,
+	}
+}
+
+func (rls *refreshingLabels) refresh(get labelsGetter) {
+	// only id, name, messageListVisibility, labelListVisibility, and type are returned by a labels list call
+	// https://developers.google.com/gmail/api/v1/reference/users/labels/list
+	r, err := get()
 	if err != nil {
+		// TODO: handle
 		log.Fatalf("Unable to retrieve labels: %v", err)
 	}
 	if len(r.Labels) == 0 {
+		*rls = nil
 		fmt.Println("No labels found.")
 		return
 	}
-	fmt.Println("Labels:")
-	for _, l := range r.Labels {
-		fmt.Printf("- %s\n", l.Name)
+	ls := make([]gmailLabel, len(r.Labels))
+	for i, l := range r.Labels {
+		ls[i] = gmailLabel{name: l.Name, id: l.Id, ttype: l.Type}
 	}
+	*rls = ls
 }
+
+type labelsGetter func(opts ...googleapi.CallOption) (*gmail.ListLabelsResponse, error)
 
 // [END gmail_quickstart]
