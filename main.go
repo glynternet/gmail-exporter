@@ -26,6 +26,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/net/context"
@@ -195,22 +196,26 @@ func (e *exporter) start() {
 		e.refreshingLabels = refreshingLabels{}
 	}
 
-	e.refreshLabels()
-	fmt.Println(e.refreshingLabels)
+	if err := e.refreshLabels(); err != nil {
+		log.Printf("Error doing initial periodic label refresh: %v", err)
+	}
+	fmt.Println("Labels: ", e.refreshingLabels)
 	// TODO(gynternet): handle stopping ticker
 	t := time.NewTicker(e.labelRefreshPeriod)
 
 	for range t.C {
-		e.refreshLabels()
+		if err := e.refreshLabels(); err != nil {
+			log.Printf("Error doing periodic label refresh: %v", err)
+		}
 		// log here
-		fmt.Println(e.refreshingLabels)
+		fmt.Println("Labels: ", e.refreshingLabels)
 	}
 }
 
 const userID = "me"
 
-func (e *exporter) refreshLabels() {
-	e.refresh(e.List(userID).Do)
+func (e *exporter) refreshLabels() error {
+	return e.refresh(e.List(userID).Do)
 }
 
 type refreshingLabels []gmailLabel
@@ -227,24 +232,26 @@ func (l gmailLabel) promLabels() prometheus.Labels {
 	}
 }
 
-func (rls *refreshingLabels) refresh(get labelsGetter) {
+func (rls *refreshingLabels) refresh(get labelsGetter) error {
 	// only id, name, messageListVisibility, labelListVisibility, and type are returned by a labels list call
 	// https://developers.google.com/gmail/api/v1/reference/users/labels/list
 	r, err := get()
 	if err != nil {
 		// TODO: handle
-		log.Fatalf("Unable to retrieve labels: %v", err)
+		return errors.Wrap(err, "getting labels: %v")
 	}
 	if len(r.Labels) == 0 {
 		*rls = nil
+		// TODO: WARN log
 		fmt.Println("No labels found.")
-		return
+		return nil
 	}
 	ls := make([]gmailLabel, len(r.Labels))
 	for i, l := range r.Labels {
 		ls[i] = gmailLabel{name: l.Name, id: l.Id, ttype: l.Type}
 	}
 	*rls = ls
+	return nil
 }
 
 type labelsGetter func(opts ...googleapi.CallOption) (*gmail.ListLabelsResponse, error)
