@@ -237,8 +237,7 @@ func (rls *refreshingLabels) refresh(get labelsGetter) error {
 	// https://developers.google.com/gmail/api/v1/reference/users/labels/list
 	r, err := get()
 	if err != nil {
-		// TODO: handle
-		return errors.Wrap(err, "getting labels: %v")
+		return errors.Wrap(err, "getting labels")
 	}
 	if len(r.Labels) == 0 {
 		*rls = nil
