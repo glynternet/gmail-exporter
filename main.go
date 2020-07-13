@@ -36,6 +36,12 @@ import (
 	"google.golang.org/api/googleapi"
 )
 
+var refreshLabelsErrs = prometheus.NewCounter(prometheus.CounterOpts{
+	Namespace: "gmail",
+	Name:      "refresh_labels_errors_total",
+	Help:      "Number of refresh labels errors.",
+})
+
 // Retrieve a token, saves the token, then returns the generated client.
 func getClient(config *oauth2.Config) *http.Client {
 	// The file token.json stores the user's access and refresh tokens, and is
@@ -120,6 +126,10 @@ func main() {
 	// Expose the registered metrics via HTTP.
 	registry := prometheus.NewRegistry()
 	if err = registry.Register(&e); err != nil {
+		panic(err)
+	}
+
+	if err = registry.Register(refreshLabelsErrs); err != nil {
 		panic(err)
 	}
 
@@ -215,7 +225,11 @@ func (e *exporter) start() {
 const userID = "me"
 
 func (e *exporter) refreshLabels() error {
-	return e.refresh(e.List(userID).Do)
+	err := e.refresh(e.List(userID).Do)
+	if err != nil {
+		refreshLabelsErrs.Inc()
+	}
+	return err
 }
 
 type refreshingLabels []gmailLabel
