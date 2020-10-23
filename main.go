@@ -119,7 +119,7 @@ func main() {
 		UsersLabelsService: srv.Users.Labels,
 		labelRefreshPeriod: time.Minute * 5,
 	}
-	go e.start()
+	go e.startRefreshingLabels()
 
 	prometheus.NewPedanticRegistry()
 
@@ -201,7 +201,7 @@ func (e *exporter) Collect(metrics chan<- prometheus.Metric) {
 	}
 }
 
-func (e *exporter) start() {
+func (e *exporter) startRefreshingLabels() {
 	if e.refreshingLabels == nil {
 		e.refreshingLabels = refreshingLabels{}
 	}
