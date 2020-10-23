@@ -18,6 +18,8 @@
 package main
 
 import (
+	"crypto/sha512"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -26,6 +28,7 @@ import (
 	"os"
 	"time"
 
+	ghttp "github.com/glynternet/pkg/http"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -104,6 +107,11 @@ func main() {
 		logger.Fatalf("Unable to read client secret file: %v", err)
 	}
 
+	scrapeToken, err := ioutil.ReadFile("scrape_token")
+	if err != nil {
+		logger.Fatalf("Unable to read scrape token file: %v", err)
+	}
+
 	// If modifying these scopes, delete your previously saved token.json.
 	config, err := google.ConfigFromJSON(b, gmail.GmailMetadataScope)
 	if err != nil {
@@ -135,17 +143,34 @@ func main() {
 		panic(err)
 	}
 
-	http.Handle("/metrics", promhttp.HandlerFor(
+	http.Handle("/metrics", ghttp.WithAuthoriser(logger, newBearerTokenAuthoriser(scrapeToken), promhttp.HandlerFor(
 		registry,
 		promhttp.HandlerOpts{
 			// Opt into OpenMetrics to support exemplars.
 			EnableOpenMetrics: true,
 		},
-	))
+	)))
 
 	addr := ":8765"
 	fmt.Println("listening at ", addr)
 	logger.Fatal(http.ListenAndServe(addr, nil))
+}
+
+func newBearerTokenAuthoriser(token []byte) bearerTokenAuthoriser {
+	return bearerTokenAuthoriser{authorizedHeaderSha512: sha512.Sum512(append([]byte("Bearer "), token...))}
+}
+
+type bearerTokenAuthoriser struct {
+	authorizedHeaderSha512 [64]byte
+}
+
+func (b bearerTokenAuthoriser) Authorise(r *http.Request) error {
+	authHeader := r.Header.Get("Authorization")
+	givenSha := sha512.Sum512([]byte(authHeader))
+	if subtle.ConstantTimeCompare(givenSha[:], b.authorizedHeaderSha512[:]) != 1 {
+		return errors.New("invalid authorization header")
+	}
+	return nil
 }
 
 type exporter struct {
