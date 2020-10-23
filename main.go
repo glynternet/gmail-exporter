@@ -43,33 +43,33 @@ var refreshLabelsErrs = prometheus.NewCounter(prometheus.CounterOpts{
 })
 
 // Retrieve a token, saves the token, then returns the generated client.
-func getClient(config *oauth2.Config) *http.Client {
+func getClient(logger *log.Logger, config *oauth2.Config) *http.Client {
 	// The file token.json stores the user's access and refresh tokens, and is
 	// created automatically when the authorization flow completes for the first
 	// time.
 	tokFile := "token.json"
 	tok, err := tokenFromFile(tokFile)
 	if err != nil {
-		tok = getTokenFromWeb(config)
-		saveToken(tokFile, tok)
+		tok = getTokenFromWeb(logger, config)
+		saveToken(logger, tokFile, tok)
 	}
 	return config.Client(context.Background(), tok)
 }
 
 // Request a token from the web, then returns the retrieved token.
-func getTokenFromWeb(config *oauth2.Config) *oauth2.Token {
+func getTokenFromWeb(logger *log.Logger, config *oauth2.Config) *oauth2.Token {
 	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
 	fmt.Printf("Go to the following link in your browser then type the "+
 		"authorization code: \n%v\n", authURL)
 
 	var authCode string
 	if _, err := fmt.Scan(&authCode); err != nil {
-		log.Fatalf("Unable to read authorization code: %v", err)
+		logger.Fatalf("Unable to read authorization code: %v", err)
 	}
 
 	tok, err := config.Exchange(context.TODO(), authCode)
 	if err != nil {
-		log.Fatalf("Unable to retrieve token from web: %v", err)
+		logger.Fatalf("Unable to retrieve token from web: %v", err)
 	}
 	return tok
 }
@@ -87,37 +87,39 @@ func tokenFromFile(file string) (*oauth2.Token, error) {
 }
 
 // Saves a token to a file path.
-func saveToken(path string, token *oauth2.Token) {
+func saveToken(logger *log.Logger, path string, token *oauth2.Token) {
 	fmt.Printf("Saving credential file to: %s\n", path)
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		log.Fatalf("Unable to cache oauth token: %v", err)
+		logger.Fatalf("Unable to cache oauth token: %v", err)
 	}
 	defer f.Close()
 	json.NewEncoder(f).Encode(token)
 }
 
 func main() {
+	logger := log.New(os.Stderr, "", log.LstdFlags)
 	b, err := ioutil.ReadFile("credentials.json")
 	if err != nil {
-		log.Fatalf("Unable to read client secret file: %v", err)
+		logger.Fatalf("Unable to read client secret file: %v", err)
 	}
 
 	// If modifying these scopes, delete your previously saved token.json.
 	config, err := google.ConfigFromJSON(b, gmail.GmailMetadataScope)
 	if err != nil {
-		log.Fatalf("Unable to parse client secret file to config: %v", err)
+		logger.Fatalf("Unable to parse client secret file to config: %v", err)
 	}
-	client := getClient(config)
+	client := getClient(logger, config)
 
 	srv, err := gmail.New(client)
 	if err != nil {
-		log.Fatalf("Unable to retrieve Gmail client: %v", err)
+		logger.Fatalf("Unable to retrieve Gmail client: %v", err)
 	}
 
 	e := exporter{
 		UsersLabelsService: srv.Users.Labels,
 		labelRefreshPeriod: time.Minute * 5,
+		logger:             logger,
 	}
 	go e.startRefreshingLabels()
 
@@ -143,13 +145,14 @@ func main() {
 
 	addr := ":8765"
 	fmt.Println("listening at ", addr)
-	log.Fatal(http.ListenAndServe(addr, nil))
+	logger.Fatal(http.ListenAndServe(addr, nil))
 }
 
 type exporter struct {
 	*gmail.UsersLabelsService
 	labelRefreshPeriod time.Duration
 	refreshingLabels
+	logger *log.Logger
 }
 
 func (e exporter) Describe(_ chan<- *prometheus.Desc) {
@@ -168,7 +171,7 @@ func (e *exporter) Collect(metrics chan<- prometheus.Metric) {
 		lData, err := e.Get(userID, label.id).Do()
 		if err != nil {
 			// how do I return an error so that it will be shown in prometheus here?
-			log.Println(fmt.Errorf("getting label data for label: %s: %v", label.id, err))
+			e.logger.Println(fmt.Errorf("getting label data for label: %s: %v", label.id, err))
 			return
 		}
 		total, err := prometheus.NewConstMetric(
@@ -207,7 +210,7 @@ func (e *exporter) startRefreshingLabels() {
 	}
 
 	if err := e.refreshLabels(); err != nil {
-		log.Printf("Error doing initial periodic label refresh: %v", err)
+		e.logger.Printf("Error doing initial periodic label refresh: %v", err)
 	}
 	fmt.Println("Labels: ", e.refreshingLabels)
 	// TODO(gynternet): handle stopping ticker
@@ -215,7 +218,7 @@ func (e *exporter) startRefreshingLabels() {
 
 	for range t.C {
 		if err := e.refreshLabels(); err != nil {
-			log.Printf("Error doing periodic label refresh: %v", err)
+			e.logger.Printf("Error doing periodic label refresh: %v", err)
 		}
 		// log here
 		fmt.Println("Labels: ", e.refreshingLabels)
