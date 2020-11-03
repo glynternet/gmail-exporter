@@ -1,0 +1,32 @@
+# dubplate version: v0.8.1
+
+workspace:
+
+  base: /go/src
+  path: github.com/glynternet/gmail-exporter
+
+
+pipeline:
+
+  run-unit-tests:
+    image: golang:1.13.6
+    commands:
+      - go test -v -race ./...
+
+  # drone mounts the root directory of the repository to the container and sets
+  # it as the working directory
+  run-linters:
+    image: golangci/golangci-lint:v1.22.2-alpine
+    commands:
+      - golangci-lint run -v
+
+  build-binaries:
+    image: golang:1.13.6
+    commands:
+      - make binaries
+
+  # images are not yet supported
+  # build-images:
+    # image: HMMMMMMMMM
+    # environment:
+      # - DOCKER_USERNAME=

@@ -1,20 +1,3 @@
-/**
- * @license
- * Copyright Google Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     https://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-// [START gmail_quickstart]
 package main
 
 import (
@@ -23,21 +6,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"os"
 	"time"
 
 	ghttp "github.com/glynternet/pkg/http"
+	"github.com/glynternet/pkg/log"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/spf13/cobra"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/gmail/v1"
 	"google.golang.org/api/googleapi"
 )
+
+func buildCmdTree(logger log.Logger, _ *os.File, rootCmd *cobra.Command) {
+	rootCmd.RunE = run(logger)
+}
 
 var refreshLabelsErrs = prometheus.NewCounter(prometheus.CounterOpts{
 	Namespace: "gmail",
@@ -46,35 +34,37 @@ var refreshLabelsErrs = prometheus.NewCounter(prometheus.CounterOpts{
 })
 
 // Retrieve a token, saves the token, then returns the generated client.
-func getClient(logger *log.Logger, config *oauth2.Config) *http.Client {
+func getClient(config *oauth2.Config) (*http.Client, error) {
 	// The file token.json stores the user's access and refresh tokens, and is
 	// created automatically when the authorization flow completes for the first
 	// time.
 	tokFile := "token.json"
 	tok, err := tokenFromFile(tokFile)
 	if err != nil {
-		tok = getTokenFromWeb(logger, config)
-		saveToken(logger, tokFile, tok)
+		tok, _ = getTokenFromWeb(config)
+		if err := saveToken(tokFile, tok); err != nil {
+			return nil, errors.Wrap(err, "saving token")
+		}
 	}
-	return config.Client(context.Background(), tok)
+	return config.Client(context.Background(), tok), nil
 }
 
 // Request a token from the web, then returns the retrieved token.
-func getTokenFromWeb(logger *log.Logger, config *oauth2.Config) *oauth2.Token {
+func getTokenFromWeb(config *oauth2.Config) (*oauth2.Token, error) {
 	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
 	fmt.Printf("Go to the following link in your browser then type the "+
 		"authorization code: \n%v\n", authURL)
 
 	var authCode string
 	if _, err := fmt.Scan(&authCode); err != nil {
-		logger.Fatalf("Unable to read authorization code: %v", err)
+		return nil, fmt.Errorf("unable to read authorization code: %v", err)
 	}
 
 	tok, err := config.Exchange(context.TODO(), authCode)
 	if err != nil {
-		logger.Fatalf("Unable to retrieve token from web: %v", err)
+		return nil, fmt.Errorf("unable to retrieve token from web: %v", err)
 	}
-	return tok
+	return tok, nil
 }
 
 // Retrieves a token from a local file.
@@ -90,70 +80,76 @@ func tokenFromFile(file string) (*oauth2.Token, error) {
 }
 
 // Saves a token to a file path.
-func saveToken(logger *log.Logger, path string, token *oauth2.Token) {
+func saveToken(path string, token *oauth2.Token) error {
 	fmt.Printf("Saving credential file to: %s\n", path)
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
-		logger.Fatalf("Unable to cache oauth token: %v", err)
+		return fmt.Errorf("Unable to cache oauth token: %v", err)
 	}
 	defer f.Close()
 	json.NewEncoder(f).Encode(token)
+	return nil
 }
 
-func main() {
-	logger := log.New(os.Stderr, "", log.LstdFlags)
-	b, err := ioutil.ReadFile("credentials.json")
-	if err != nil {
-		logger.Fatalf("Unable to read client secret file: %v", err)
+func run(logger log.Logger) func(*cobra.Command, []string) error {
+	return func(command *cobra.Command, strings []string) error {
+		b, err := ioutil.ReadFile("credentials.json")
+		if err != nil {
+			return fmt.Errorf("unable to read client secret file: %v", err)
+		}
+
+		scrapeToken, err := ioutil.ReadFile("scrape_token")
+		if err != nil {
+			return fmt.Errorf("unable to read scrape token file: %v", err)
+		}
+
+		// If modifying these scopes, delete your previously saved token.json.
+		config, err := google.ConfigFromJSON(b, gmail.GmailMetadataScope)
+		if err != nil {
+			return fmt.Errorf("unable to parse client secret file to config: %v", err)
+		}
+
+		client, err := getClient(config)
+		if err != nil {
+			return errors.Wrap(err, "getting client")
+		}
+
+		srv, err := gmail.New(client)
+		if err != nil {
+			return fmt.Errorf("unable to retrieve Gmail client: %v", err)
+		}
+
+		e := exporter{
+			UsersLabelsService: srv.Users.Labels,
+			labelRefreshPeriod: time.Minute * 5,
+			logger:             logger,
+		}
+		go e.startRefreshingLabels()
+
+		prometheus.NewPedanticRegistry()
+
+		// Expose the registered metrics via HTTP.
+		registry := prometheus.NewRegistry()
+		if err = registry.Register(&e); err != nil {
+			panic(err)
+		}
+
+		if err = registry.Register(refreshLabelsErrs); err != nil {
+			panic(err)
+		}
+
+		http.Handle("/metrics", ghttp.WithAuthoriser(logger, newBearerTokenAuthoriser(scrapeToken), promhttp.HandlerFor(
+			registry,
+			promhttp.HandlerOpts{
+				// Opt into OpenMetrics to support exemplars.
+				EnableOpenMetrics: true,
+			},
+		)))
+
+		addr := ":8765"
+		fmt.Println("listening at ", addr)
+		return errors.Wrap(http.ListenAndServe(addr, nil), "serving")
 	}
-
-	scrapeToken, err := ioutil.ReadFile("scrape_token")
-	if err != nil {
-		logger.Fatalf("Unable to read scrape token file: %v", err)
-	}
-
-	// If modifying these scopes, delete your previously saved token.json.
-	config, err := google.ConfigFromJSON(b, gmail.GmailMetadataScope)
-	if err != nil {
-		logger.Fatalf("Unable to parse client secret file to config: %v", err)
-	}
-	client := getClient(logger, config)
-
-	srv, err := gmail.New(client)
-	if err != nil {
-		logger.Fatalf("Unable to retrieve Gmail client: %v", err)
-	}
-
-	e := exporter{
-		UsersLabelsService: srv.Users.Labels,
-		labelRefreshPeriod: time.Minute * 5,
-		logger:             logger,
-	}
-	go e.startRefreshingLabels()
-
-	prometheus.NewPedanticRegistry()
-
-	// Expose the registered metrics via HTTP.
-	registry := prometheus.NewRegistry()
-	if err = registry.Register(&e); err != nil {
-		panic(err)
-	}
-
-	if err = registry.Register(refreshLabelsErrs); err != nil {
-		panic(err)
-	}
-
-	http.Handle("/metrics", ghttp.WithAuthoriser(logger, newBearerTokenAuthoriser(scrapeToken), promhttp.HandlerFor(
-		registry,
-		promhttp.HandlerOpts{
-			// Opt into OpenMetrics to support exemplars.
-			EnableOpenMetrics: true,
-		},
-	)))
-
-	addr := ":8765"
-	fmt.Println("listening at ", addr)
-	logger.Fatal(http.ListenAndServe(addr, nil))
 }
 
 func newBearerTokenAuthoriser(token []byte) bearerTokenAuthoriser {
@@ -177,7 +173,7 @@ type exporter struct {
 	*gmail.UsersLabelsService
 	labelRefreshPeriod time.Duration
 	refreshingLabels
-	logger *log.Logger
+	logger log.Logger
 }
 
 func (e exporter) Describe(_ chan<- *prometheus.Desc) {
@@ -196,7 +192,7 @@ func (e *exporter) Collect(metrics chan<- prometheus.Metric) {
 		lData, err := e.Get(userID, label.id).Do()
 		if err != nil {
 			// how do I return an error so that it will be shown in prometheus here?
-			e.logger.Println(fmt.Errorf("getting label data for label: %s: %v", label.id, err))
+			e.logger.Log(log.Error(fmt.Errorf("getting label data for label: %s: %v", label.id, err)))
 			return
 		}
 		total, err := prometheus.NewConstMetric(
@@ -235,7 +231,9 @@ func (e *exporter) startRefreshingLabels() {
 	}
 
 	if err := e.refreshLabels(); err != nil {
-		e.logger.Printf("Error doing initial periodic label refresh: %v", err)
+		_ = e.logger.Log(
+			log.Message("Error doing initial periodic label refresh"),
+			log.Error(err))
 	}
 	fmt.Println("Labels: ", e.refreshingLabels)
 	// TODO(gynternet): handle stopping ticker
@@ -243,10 +241,15 @@ func (e *exporter) startRefreshingLabels() {
 
 	for range t.C {
 		if err := e.refreshLabels(); err != nil {
-			e.logger.Printf("Error doing periodic label refresh: %v", err)
+			_ = e.logger.Log(
+				log.Message("Error doing periodic label refresh"),
+				log.Error(err))
 		}
 		// log here
-		fmt.Println("Labels: ", e.refreshingLabels)
+		_ = e.logger.Log(log.Message("Labels refreshed"), log.KV{
+			K: "labels",
+			V: e.refreshingLabels,
+		})
 	}
 }
 
@@ -296,5 +299,3 @@ func (rls *refreshingLabels) refresh(get labelsGetter) error {
 }
 
 type labelsGetter func(opts ...googleapi.CallOption) (*gmail.ListLabelsResponse, error)
-
-// [END gmail_quickstart]
